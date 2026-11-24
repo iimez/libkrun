@@ -41,6 +41,8 @@ enum FsServer {
     #[cfg(unix)]
     Dynamic(Server<AugmentFs<DynamicRootFs>>),
     #[cfg(unix)]
+    CheckedDynamic(Server<AugmentFs<PolicyFs<DynamicRootFs>>>),
+    #[cfg(unix)]
     CheckedReadWrite(Server<AugmentFs<PolicyFs<PassthroughFs>>>),
     #[cfg(unix)]
     CheckedReadOnly(Server<AugmentFs<PolicyFs<PassthroughFsRo>>>),
@@ -77,6 +79,8 @@ impl FsServer {
             Null,
             #[cfg(unix)]
             Dynamic,
+            #[cfg(unix)]
+            CheckedDynamic,
             #[cfg(unix)]
             CheckedReadWrite,
             #[cfg(unix)]
@@ -124,11 +128,19 @@ impl FsWorker {
         let (dynamic_shares, policy) = (None::<Infallible>, None::<Infallible>);
         let server = match (passthrough_cfg, dynamic_shares, policy) {
             #[cfg(unix)]
-            (Some(cfg), Some(shares), _) => FsServer::Dynamic(Server::new(AugmentFs::new(
+            (Some(cfg), Some(shares), None) => FsServer::Dynamic(Server::new(AugmentFs::new(
                 DynamicRootFs::new(cfg, &shares),
                 &inode_alloc,
                 virtual_entries,
             ))),
+            #[cfg(unix)]
+            (Some(cfg), Some(shares), Some(policy)) => {
+                FsServer::CheckedDynamic(Server::new(AugmentFs::new(
+                    PolicyFs::new(DynamicRootFs::new(cfg, &shares), policy),
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            }
             #[cfg(unix)]
             (Some(cfg), None, Some(policy)) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;

@@ -254,7 +254,7 @@ impl Fs {
     /// Check the requests of the guest with `policy` before serving them.
     #[cfg(unix)]
     pub fn set_policy(&mut self, policy: Arc<dyn FsPolicy>) -> super::Result<()> {
-        if self.passthrough_cfg.is_none() || self.dynamic_shares.is_some() {
+        if self.passthrough_cfg.is_none() {
             return Err(FsError::NoHostDirectory);
         }
         self.policy = Some(policy);

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io;
 use std::mem;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -19,6 +21,7 @@ use super::filesystem::{
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
 use super::passthrough::{self, PassthroughFs};
+use super::policy::{HostNode, HostNodes};
 use super::read_only::PassthroughFsRo;
 use crate::virtio::bindings;
 use crate::virtio::linux_errno;
@@ -130,6 +133,7 @@ macro_rules! with_fs {
 
 struct Share {
     id: usize,
+    name: CString,
     fs: ShareFs,
     removed: AtomicBool,
     /// The guest's lookups of the share's root that it hasn't forgotten, which the passthrough
@@ -183,6 +187,7 @@ impl ServedShares {
         };
         let share = Arc::new(Share {
             id,
+            name: name.clone(),
             fs,
             removed: AtomicBool::new(false),
             root_lookups: AtomicU64::new(0),
@@ -339,6 +344,46 @@ impl DynamicRootFs {
             });
         }
         listing
+    }
+}
+
+impl HostNodes for DynamicRootFs {
+    fn host_node(&self, inode: Inode) -> io::Result<HostNode> {
+        if inode == fuse::ROOT_ID {
+            return Err(linux_errno::enoent());
+        }
+        let (share, inode) = self.route(inode)?;
+        with_fs!(share, fs => fs.host_node(inode))
+    }
+
+    fn host_child(&self, parent: Inode, name: &CStr) -> io::Result<Option<HostNode>> {
+        if parent == fuse::ROOT_ID {
+            let share = self.shares.names.read().unwrap().get(name).cloned();
+            return share.map_or(Ok(None), |share| {
+                with_fs!(share, fs => fs.host_node(fuse::ROOT_ID)).map(Some)
+            });
+        }
+        let (share, parent) = self.route(parent)?;
+        with_fs!(share, fs => fs.host_child(parent, name))
+    }
+
+    fn host_path(&self, inode: Inode) -> io::Result<Option<PathBuf>> {
+        if inode == fuse::ROOT_ID {
+            return Ok(Some(PathBuf::new()));
+        }
+        let (share, inode) = self.route(inode)?;
+        let visible = self
+            .shares
+            .names
+            .read()
+            .unwrap()
+            .get(&share.name)
+            .is_some_and(|named| named.id == share.id);
+        if !visible {
+            return Ok(None);
+        }
+        let path = with_fs!(share, fs => fs.host_path(inode))?;
+        Ok(path.map(|path| PathBuf::from(OsStr::from_bytes(share.name.to_bytes())).join(path)))
     }
 }
 
@@ -1272,5 +1317,72 @@ mod tests {
             errno(shares.add("m", missing.to_str().unwrap(), false)),
             libc::ENOENT
         );
+    }
+
+    #[test]
+    fn policies_see_paths_under_the_entry_name() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::Mutex;
+
+        use crate::virtio::fs::policy::{FsOp, FsPolicy, FsRequest, PolicyFs};
+
+        type Seen = (Option<PathBuf>, Option<(u64, u64)>);
+        struct Record(Mutex<Vec<Seen>>);
+
+        impl FsPolicy for Record {
+            fn check(&self, request: &FsRequest) -> Result<(), i32> {
+                let object = request.object();
+                let path = object.path().map(PathBuf::from);
+                let node = object.node().map(|node| (node.dev, node.ino));
+                let refuse = path.as_ref().is_some_and(|path| path.starts_with("a"))
+                    && request.op() != FsOp::Opendir;
+                self.0.lock().unwrap().push((path, node));
+                if refuse {
+                    return Err(libc::EACCES);
+                }
+                Ok(())
+            }
+        }
+
+        let (a, b) = (TestDir::new("policy-a"), TestDir::new("policy-b"));
+        let shares = DynamicShares::new();
+        shares.add("a", a.path(), false).unwrap();
+        shares.add("b", b.path(), false).unwrap();
+        let record = Arc::new(Record(Mutex::new(Vec::new())));
+        let fs = PolicyFs::new(
+            DynamicRootFs::new(passthrough::Config::default(), &shares),
+            record.clone(),
+        );
+        fs.init(FsOptions::empty()).unwrap();
+        let lookup = |parent, name: &str| {
+            fs.lookup(ctx(), parent, &CString::new(name).unwrap())
+                .unwrap()
+                .inode
+        };
+        let open = |inode| fs.open(ctx(), inode, false, libc::O_RDONLY as u32);
+
+        let file_a = lookup(lookup(fuse::ROOT_ID, "a"), "file");
+        let file_b = lookup(lookup(fuse::ROOT_ID, "b"), "file");
+        assert_eq!(
+            errno(open(file_a)),
+            linux_errno::eacces().raw_os_error().unwrap()
+        );
+        open(file_b).unwrap();
+        fs.opendir(ctx(), fuse::ROOT_ID, 0).unwrap();
+        shares.remove("b").unwrap();
+        open(file_b).unwrap();
+
+        let meta = fs::metadata(b.0.join("file")).unwrap();
+        let seen = record.0.lock().unwrap();
+        assert_eq!(seen[0].0, Some(PathBuf::from("a/file")));
+        assert_eq!(
+            seen[1],
+            (
+                Some(PathBuf::from("b/file")),
+                Some((meta.dev(), meta.ino()))
+            )
+        );
+        assert_eq!(seen[2], (Some(PathBuf::new()), None));
+        assert_eq!(seen[3], (None, Some((meta.dev(), meta.ino()))));
     }
 }

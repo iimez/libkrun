@@ -830,9 +830,10 @@ impl FsDevice<'_> {
     /// The policy may decide differently from one request to the next, through state the
     /// embedder keeps and changes while the VM runs. A file the guest already read may stay
     /// readable from its page cache whatever the policy decides; use
-    /// [`CachePolicy::Never`] to avoid that. A NullFs device has no host files and returns
-    /// `InvalidParam`, and so does a device made by [`new_dynamic`](Self::new_dynamic).
-    /// Returns [`VmmError::FeatureDisabled`] on Windows.
+    /// [`CachePolicy::Never`] to avoid that. On a device made by
+    /// [`new_dynamic`](Self::new_dynamic), paths start with the name of the entry, and a file
+    /// under an entry that was removed has no path. A NullFs device has no host files and
+    /// returns `InvalidParam`. Returns [`VmmError::FeatureDisabled`] on Windows.
     pub fn set_policy(&mut self, policy: Arc<dyn FsPolicy>) -> Result<(), VmmError> {
         #[cfg(unix)]
         {
