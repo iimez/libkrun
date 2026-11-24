@@ -74,6 +74,18 @@ mod test_virtiofs_dynamic_shares;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_dynamic_shares::TestVirtiofsDynamicShares;
 
+// FsDevice::set_policy() has no C API, so this test needs libkrun linked as a Rust crate.
+#[cfg(all(
+    any(feature = "host", target_os = "linux"),
+    not(feature = "dynamic-linking")
+))]
+mod test_virtiofs_policy;
+#[cfg(all(
+    any(feature = "host", target_os = "linux"),
+    not(feature = "dynamic-linking")
+))]
+use test_virtiofs_policy::TestVirtiofsPolicy;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -290,6 +302,11 @@ pub fn test_cases() -> Vec<TestCase> {
             "virtiofs-dynamic-shares",
             Box::new(TestVirtiofsDynamicShares),
         ),
+        #[cfg(all(
+            any(feature = "host", target_os = "linux"),
+            not(feature = "dynamic-linking")
+        ))]
+        TestCase::new("virtiofs-policy", Box::new(TestVirtiofsPolicy)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]
