@@ -44,35 +44,22 @@ impl FsServer {
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> super::Result<usize> {
-        match self {
-            FsServer::ReadWrite(s) => s.handle_message(
-                r,
-                w,
-                allow_idmap,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
-            FsServer::ReadOnly(s) => s.handle_message(
-                r,
-                w,
-                allow_idmap,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
-            FsServer::Null(s) => s.handle_message(
-                r,
-                w,
-                allow_idmap,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
+        macro_rules! dispatch {
+            ($($(#[$attr:meta])* $variant:ident),* $(,)?) => {
+                match self {
+                    $($(#[$attr])* FsServer::$variant(s) => s.handle_message(
+                        r,
+                        w,
+                        allow_idmap,
+                        shm_region,
+                        exit_code,
+                        #[cfg(target_os = "macos")]
+                        map_sender,
+                    ),)*
+                }
+            };
         }
+        dispatch!(ReadWrite, ReadOnly, Null)
     }
 }
 
