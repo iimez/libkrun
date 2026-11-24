@@ -37,6 +37,8 @@ use devices::virtio::balloon::FreePageReportingMode;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::fs::FsPolicy;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use devices::virtio::fs::{CachePolicy, PermissionSemantics};
@@ -810,6 +812,41 @@ impl<'a> FsDevice<'a> {
             return Err(VmmError::InvalidParam());
         }
         Ok(())
+    }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl FsDevice<'_> {
+    /// Check the guest's requests with `policy` before they are served, before attaching this
+    /// device.
+    ///
+    /// The policy is asked before each request that opens a file or directory, creates,
+    /// removes, renames or links a name, changes attributes, reads a symlink, or reads or
+    /// changes extended attributes, and a refusal fails the request with the errno it returns.
+    /// Lookups and attributes are not checked, so the guest still sees every name and its size.
+    /// Reads and writes through a handle are not checked again: a handle opened before the
+    /// policy changes its mind keeps the access it was opened with.
+    ///
+    /// The policy may decide differently from one request to the next, through state the
+    /// embedder keeps and changes while the VM runs. A file the guest already read may stay
+    /// readable from its page cache whatever the policy decides; use
+    /// [`CachePolicy::Never`] to avoid that. A NullFs device has no host files and returns
+    /// `InvalidParam`, and so does a device made by [`new_dynamic`](Self::new_dynamic).
+    /// Returns [`VmmError::FeatureDisabled`] on Windows.
+    pub fn set_policy(&mut self, policy: Arc<dyn FsPolicy>) -> Result<(), VmmError> {
+        #[cfg(unix)]
+        {
+            self.inner
+                .lock()
+                .unwrap()
+                .set_policy(policy)
+                .map_err(|_| VmmError::InvalidParam())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = policy;
+            Err(VmmError::FeatureDisabled())
+        }
     }
 }
 
