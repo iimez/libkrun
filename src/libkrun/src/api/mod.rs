@@ -27,6 +27,8 @@ pub use device_builders::BlockDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::CachePolicy;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::DynamicShares;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsOverlay;
@@ -139,6 +141,8 @@ ffier::library_definition!("krun", library_tag = 1,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::RngDevice,
     crate::api::device_builders::AttachDevice for crate::api::device_builders::VsockDevice,
     trait crate::api::device_builders::AttachDevice = 28,
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    crate::api::device_builders::DynamicShares = 29,
     trait ffier_builtins::PushStr = 12,
     trait ffier_builtins::Error = 13,
     Error for crate::api::error::VmmError,

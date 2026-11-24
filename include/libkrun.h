@@ -38,6 +38,7 @@ typedef void* KrunVhostUserDevice;
 typedef void* KrunDisplayBackend;
 typedef void* KrunGpuDevice;
 typedef void* KrunInputDevice;
+typedef void* KrunDynamicShares;
 typedef void* KrunAttachDevice; /* KrunRtcDevice | KrunFsDevice | KrunConsoleDevice | KrunBlockDevice | KrunNetDevice | KrunGpuDevice | KrunInputDevice | KrunVhostUserDevice | KrunBalloonDevice | KrunRngDevice | KrunVsockDevice */
 typedef void* KrunDeviceManager; /* KrunMmioDeviceManager | KrunPciDeviceManager */
 typedef void* KrunError; /* KrunVmmError | KrunVtableError */
@@ -46,7 +47,7 @@ typedef void* KrunPushStr; /* KrunVtablePushStr */
 #ifndef KRUN_PRIMITIVES_DEFINED
 #define KRUN_PRIMITIVES_DEFINED
 
-typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice */
+typedef void* KrunObject; /* KrunVmmError | KrunMmioDeviceManager | KrunPciDeviceManager | KrunFsDevice | KrunConsoleDevice | KrunConsoleBuilder | KrunFsOverlay | KrunPayload | KrunNitroConfig | KrunVmmBuilder | KrunVmm | KrunVmmHandle | KrunBalloonDevice | KrunRngDevice | KrunRtcDevice | KrunVsockDevice | KrunBlockDevice | KrunNetDevice | KrunDisplayInfoBuilder | KrunVhostUserDevice | KrunDisplayBackend | KrunGpuDevice | KrunInputDevice | KrunDynamicShares */
 
 typedef uint64_t KrunResult;
 #define KRUN_RESULT_SUCCESS 0
@@ -288,6 +289,28 @@ typedef KrunFsDevice (*krun_fs_device_new_read_only_fn)(KrunStr tag, KrunStr hos
  */
 KrunFsDevice krun_fs_device_new_null(KrunStr tag, KrunError* err_out);
 typedef KrunFsDevice (*krun_fs_device_new_null_fn)(KrunStr tag, KrunError* err_out);
+/**
+ * Create a virtiofs device whose root lists host directories that are added and removed
+ * while the VM runs, through the handle returned by
+ * [`dynamic_shares`](Self::dynamic_shares).
+ *
+ * The root is a read-only directory that lists one directory per entry. The permission
+ * semantics, cache policy and cache timeouts set on this device apply to every entry; the
+ * root and its entries are always looked up without caching. DAX is not supported:
+ * attaching the device with a DAX window set returns `InvalidParam`.
+ *
+ * Returns [`VmmError::FeatureDisabled`] on Windows.
+ */
+KrunFsDevice krun_fs_device_new_dynamic(KrunStr tag, KrunError* err_out);
+typedef KrunFsDevice (*krun_fs_device_new_dynamic_fn)(KrunStr tag, KrunError* err_out);
+/**
+ * The handle that adds and removes the entries of a device made by
+ * [`new_dynamic`](Self::new_dynamic). It stays usable after the device is attached
+ * and the VM is running. Returns `InvalidParam` for any other device, and
+ * [`VmmError::FeatureDisabled`] on Windows.
+ */
+KrunDynamicShares krun_fs_device_dynamic_shares(KrunFsDevice handle, KrunError* err_out);
+typedef KrunDynamicShares (*krun_fs_device_dynamic_shares_fn)(KrunFsDevice handle, KrunError* err_out);
 /**
  * Set a pre-built [`FsOverlay`] on this device.
  *
@@ -900,6 +923,37 @@ typedef KrunInputDevice (*krun_input_device_new_from_fd_fn)(int input_fd, KrunEr
 #endif
 void krun_input_device_destroy(KrunInputDevice handle);
 typedef void (*krun_input_device_destroy_fn)(KrunInputDevice handle);
+#if !((defined(KRUN_CFG_FEATURE_TEE) || defined(KRUN_CFG_FEATURE_AWS_NITRO)))
+
+/* DynamicShares ----------------------------------------------------- */
+
+/**
+ * Show the host directory `host_path` as the directory `name` at the root of the device.
+ *
+ * `name` must be a single path component that no entry has. This process must be able to
+ * open `host_path` for reading: when it runs in a sandbox that limits which files it can
+ * open, the guest would otherwise see the name but nothing under it. Returns
+ * `InvalidParam` for a bad or taken name or a path that isn't a directory, and
+ * `FileNotFound` if the path doesn't exist.
+ */
+KrunResult krun_dynamic_shares_add(KrunDynamicShares handle, KrunStr name, KrunStr host_path, KrunError* err_out);
+typedef KrunResult (*krun_dynamic_shares_add_fn)(KrunDynamicShares handle, KrunStr name, KrunStr host_path, KrunError* err_out);
+/** As [`add`](Self::add), and every write to the directory is refused with `EROFS`. */
+KrunResult krun_dynamic_shares_add_read_only(KrunDynamicShares handle, KrunStr name, KrunStr host_path, KrunError* err_out);
+typedef KrunResult (*krun_dynamic_shares_add_read_only_fn)(KrunDynamicShares handle, KrunStr name, KrunStr host_path, KrunError* err_out);
+/**
+ * Hide the entry `name` from the guest.
+ *
+ * The guest can no longer look the name up, and the root no longer lists it. What the
+ * guest holds open under it, a file or a working directory, keeps working until the guest
+ * lets go of it, as with a directory removed while in use, and data the guest has cached
+ * stays readable to it. Returns `FileNotFound` if there is no entry `name`.
+ */
+KrunResult krun_dynamic_shares_remove(KrunDynamicShares handle, KrunStr name, KrunError* err_out);
+typedef KrunResult (*krun_dynamic_shares_remove_fn)(KrunDynamicShares handle, KrunStr name, KrunError* err_out);
+void krun_dynamic_shares_destroy(KrunDynamicShares handle);
+typedef void (*krun_dynamic_shares_destroy_fn)(KrunDynamicShares handle);
+#endif
 
 /* DeviceManager (dispatch) ------------------------------------------ */
 

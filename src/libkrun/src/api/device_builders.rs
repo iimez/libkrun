@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use std::ffi::CString;
+#[cfg(all(unix, not(any(feature = "tee", feature = "aws-nitro"))))]
+use std::io;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
 #[cfg(feature = "blk")]
@@ -668,6 +670,51 @@ impl<'a> FsDevice<'a> {
         Self::new_inner(tag, None, false)
     }
 
+    /// Create a virtiofs device whose root lists host directories that are added and removed
+    /// while the VM runs, through the handle returned by
+    /// [`dynamic_shares`](Self::dynamic_shares).
+    ///
+    /// The root is a read-only directory that lists one directory per entry. The permission
+    /// semantics, cache policy and cache timeouts set on this device apply to every entry; the
+    /// root and its entries are always looked up without caching. DAX is not supported:
+    /// attaching the device with a DAX window set returns `InvalidParam`.
+    ///
+    /// Returns [`VmmError::FeatureDisabled`] on Windows.
+    pub fn new_dynamic(tag: &str) -> Result<Self, VmmError> {
+        #[cfg(unix)]
+        {
+            let fs = devices::virtio::Fs::new_dynamic(
+                tag.to_string(),
+                PermissionSemantics::LinuxComplete,
+                Arc::new(AtomicI32::new(i32::MAX)),
+            )
+            .map_err(|e| VmmError::Internal(format!("fs device: {e:?}")))?;
+            Ok(Self::with_fs(tag, fs))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tag;
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+
+    /// The handle that adds and removes the entries of a device made by
+    /// [`new_dynamic`](Self::new_dynamic). It stays usable after the device is attached
+    /// and the VM is running. Returns `InvalidParam` for any other device, and
+    /// [`VmmError::FeatureDisabled`] on Windows.
+    pub fn dynamic_shares(&self) -> Result<DynamicShares, VmmError> {
+        #[cfg(unix)]
+        {
+            let fs = self.inner.lock().unwrap();
+            let inner = fs.dynamic_shares().ok_or_else(VmmError::InvalidParam)?;
+            Ok(DynamicShares {
+                inner: inner.clone(),
+            })
+        }
+        #[cfg(not(unix))]
+        Err(VmmError::FeatureDisabled())
+    }
+
     /// Set a pre-built [`FsOverlay`] on this device.
     ///
     /// The overlay entries are resolved (applied to the underlying
@@ -780,13 +827,104 @@ impl<'a> FsDevice<'a> {
         )
         .map_err(|e| VmmError::Internal(format!("fs device: {e:?}")))?;
 
-        Ok(Self {
+        Ok(Self::with_fs(tag, fs))
+    }
+
+    fn with_fs(tag: &str, fs: devices::virtio::Fs) -> Self {
+        Self {
             inner: Arc::new(Mutex::new(fs)),
             tag: tag.to_string(),
             shm_size: None,
             overlay: None,
             _lifetime: PhantomData,
-        })
+        }
+    }
+}
+
+/// The directories at the root of a virtiofs device made by [`FsDevice::new_dynamic`], which
+/// can change while the VM runs.
+///
+/// Every handle of a device refers to the same entries. The methods may be called from any
+/// thread, before the VM starts or while it runs; a guest that has mounted the device sees a
+/// change the next time it looks a name up or lists the root. An entry whose directory can't
+/// be served when the VM starts is logged and dropped.
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub struct DynamicShares {
+    #[cfg(unix)]
+    inner: devices::virtio::fs::DynamicShares,
+}
+
+#[cfg_attr(
+    feature = "ffi",
+    ffier::export(
+        send,
+        sync,
+        cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))"
+    )
+)]
+#[cfg_attr(
+    not(feature = "ffi"),
+    cfg(not(any(feature = "tee", feature = "aws-nitro")))
+)]
+impl DynamicShares {
+    /// Show the host directory `host_path` as the directory `name` at the root of the device.
+    ///
+    /// `name` must be a single path component that no entry has. This process must be able to
+    /// open `host_path` for reading: when it runs in a sandbox that limits which files it can
+    /// open, the guest would otherwise see the name but nothing under it. Returns
+    /// `InvalidParam` for a bad or taken name or a path that isn't a directory, and
+    /// `FileNotFound` if the path doesn't exist.
+    pub fn add(&self, name: &str, host_path: &str) -> Result<(), VmmError> {
+        self.add_share(name, host_path, false)
+    }
+
+    /// As [`add`](Self::add), and every write to the directory is refused with `EROFS`.
+    pub fn add_read_only(&self, name: &str, host_path: &str) -> Result<(), VmmError> {
+        self.add_share(name, host_path, true)
+    }
+
+    /// Hide the entry `name` from the guest.
+    ///
+    /// The guest can no longer look the name up, and the root no longer lists it. What the
+    /// guest holds open under it, a file or a working directory, keeps working until the guest
+    /// lets go of it, as with a directory removed while in use, and data the guest has cached
+    /// stays readable to it. Returns `FileNotFound` if there is no entry `name`.
+    pub fn remove(&self, name: &str) -> Result<(), VmmError> {
+        #[cfg(unix)]
+        {
+            self.inner.remove(name).map_err(dynamic_share_error)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl DynamicShares {
+    fn add_share(&self, name: &str, host_path: &str, read_only: bool) -> Result<(), VmmError> {
+        #[cfg(unix)]
+        {
+            self.inner
+                .add(name, host_path, read_only)
+                .map_err(dynamic_share_error)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, host_path, read_only);
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(feature = "tee", feature = "aws-nitro"))))]
+fn dynamic_share_error(e: io::Error) -> VmmError {
+    match e.raw_os_error() {
+        Some(libc::ENOENT) => VmmError::FileNotFound(),
+        Some(libc::EINVAL | libc::EEXIST | libc::ENOTDIR) => VmmError::InvalidParam(),
+        _ => VmmError::Internal(format!("dynamic share: {e}")),
     }
 }
 
@@ -812,6 +950,11 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
         {
             let mut fs = self.inner.lock().unwrap();
             if fs.lacks_fixed_owner() {
+                return Err(VmmError::InvalidParam());
+            }
+            // The dynamic root serves no DAX mappings.
+            #[cfg(unix)]
+            if self.shm_size.is_some() && fs.dynamic_shares().is_some() {
                 return Err(VmmError::InvalidParam());
             }
             // Wire exit code from VMM into the fs device
