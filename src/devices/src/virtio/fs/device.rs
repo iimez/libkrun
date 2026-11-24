@@ -18,6 +18,8 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
     VirtioShmRegion,
 };
+#[cfg(unix)]
+use super::DynamicShares;
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
@@ -57,6 +59,8 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
+    #[cfg(unix)]
+    dynamic_shares: Option<DynamicShares>,
     virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -98,6 +102,8 @@ impl Fs {
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
+            #[cfg(unix)]
+            dynamic_shares: None,
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
@@ -109,6 +115,33 @@ impl Fs {
             return Err(FsError::UnsupportedPermissionSemantics);
         }
         Ok(fs)
+    }
+
+    /// A device whose root lists host directories that the embedder adds and removes through
+    /// [`dynamic_shares`](Self::dynamic_shares) while the guest runs.
+    #[cfg(unix)]
+    pub fn new_dynamic(
+        fs_id: String,
+        semantics: PermissionSemantics,
+        exit_code: Arc<AtomicI32>,
+    ) -> super::Result<Fs> {
+        // Each share gets its own root directory; the rest of the configuration is shared.
+        let mut fs = Self::new(
+            fs_id,
+            semantics,
+            Some(String::new()),
+            exit_code,
+            false,
+            Vec::new(),
+        )?;
+        fs.dynamic_shares = Some(DynamicShares::new());
+        Ok(fs)
+    }
+
+    /// The entries of a device made by `new_dynamic`.
+    #[cfg(unix)]
+    pub fn dynamic_shares(&self) -> Option<&DynamicShares> {
+        self.dynamic_shares.as_ref()
     }
 
     pub fn id(&self) -> &str {
@@ -305,6 +338,8 @@ impl VirtioDevice for Fs {
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
+            #[cfg(unix)]
+            self.dynamic_shares.clone(),
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),

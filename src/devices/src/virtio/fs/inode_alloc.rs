@@ -21,6 +21,14 @@ impl InodeAllocator {
         }
     }
 
+    /// An allocator whose first number is `first`, so that several allocators can hand out
+    /// numbers from ranges that don't overlap.
+    pub fn starting_at(first: u64) -> Self {
+        Self {
+            next: AtomicU64::new(first),
+        }
+    }
+
     /// Allocate the next inode number. Each call returns a unique value.
     pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)

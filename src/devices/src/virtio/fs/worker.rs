@@ -3,6 +3,8 @@ use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
+#[cfg(not(unix))]
+use std::convert::Infallible;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -20,6 +22,8 @@ use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+#[cfg(unix)]
+use super::dynamic_root::{DynamicRootFs, DynamicShares};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
@@ -32,6 +36,8 @@ enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    #[cfg(unix)]
+    Dynamic(Server<AugmentFs<DynamicRootFs>>),
 }
 
 impl FsServer {
@@ -59,7 +65,13 @@ impl FsServer {
                 }
             };
         }
-        dispatch!(ReadWrite, ReadOnly, Null)
+        dispatch!(
+            ReadWrite,
+            ReadOnly,
+            Null,
+            #[cfg(unix)]
+            Dynamic,
+        )
     }
 }
 
@@ -88,14 +100,24 @@ impl FsWorker {
         shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
+        #[cfg(unix)] dynamic_shares: Option<DynamicShares>,
         virtual_entries: Vec<VirtualDirEntry<'static>>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
-        let server = match passthrough_cfg {
-            Some(cfg) if read_only => {
+        // No other host has dynamic shares; this lets one match serve every host.
+        #[cfg(not(unix))]
+        let dynamic_shares = None::<Infallible>;
+        let server = match (passthrough_cfg, dynamic_shares) {
+            #[cfg(unix)]
+            (Some(cfg), Some(shares)) => FsServer::Dynamic(Server::new(AugmentFs::new(
+                DynamicRootFs::new(cfg, &shares),
+                &inode_alloc,
+                virtual_entries,
+            ))),
+            (Some(cfg), None) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
@@ -103,7 +125,7 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            Some(cfg) => {
+            (Some(cfg), None) => {
                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
                     inner,
@@ -111,7 +133,7 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            None => FsServer::Null(Server::new(AugmentFs::new(
+            (None, _) => FsServer::Null(Server::new(AugmentFs::new(
                 NullFs,
                 &inode_alloc,
                 virtual_entries,

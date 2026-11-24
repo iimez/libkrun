@@ -1,5 +1,7 @@
 mod augment_fs;
 mod device;
+#[cfg(unix)]
+mod dynamic_root;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
@@ -36,6 +38,8 @@ use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
+#[cfg(unix)]
+pub use self::dynamic_root::DynamicShares;
 pub use self::filesystem::ExportTable;
 
 /// Guest file-data caching policy for a host-backed virtio-fs filesystem.

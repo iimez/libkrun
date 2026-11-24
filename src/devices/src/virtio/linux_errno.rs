@@ -281,3 +281,6 @@ pub fn erofs() -> io::Error {
 pub fn enxio() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ENXIO)
 }
+pub fn ebadf() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EBADF)
+}
