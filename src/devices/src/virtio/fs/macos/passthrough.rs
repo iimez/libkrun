@@ -5,13 +5,14 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::btree_map;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -32,6 +33,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+use super::super::policy::{HostNode, HostNodes};
 pub use super::super::{CachePolicy, PermissionSemantics};
 
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
@@ -2890,6 +2892,81 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
+    }
+}
+
+// Ownership isn't applied to the host's own attributes, so any context will do.
+const HOST_CTX: Context = Context {
+    uid: 0,
+    gid: 0,
+    pid: 0,
+};
+
+impl PassthroughFs {
+    /// Where the host says the file behind `inode` is now.
+    fn current_path(&self, inode: Inode) -> io::Result<PathBuf> {
+        // `O_EVTONLY` asks for no access to the contents, and `O_SYMLINK` opens a symlink itself.
+        let fd = match self.inode_to_handle(inode, true)? {
+            // SAFETY: duplicating a descriptor touches no memory; we check the result.
+            InodeHandle::Fd(fd) => unsafe { libc::dup(fd) },
+            // SAFETY: `path` is a valid C string; we check the result.
+            InodeHandle::Path(path) => unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_EVTONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            },
+        };
+        if fd < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        // SAFETY: we just opened this fd.
+        let f = unsafe { File::from_raw_fd(fd) };
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes to `buf`; we check the result.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        buf.truncate(len);
+        Ok(PathBuf::from(OsString::from_vec(buf)))
+    }
+}
+
+fn host_node(st: &bindings::stat64) -> HostNode {
+    HostNode {
+        dev: st.st_dev as u64,
+        ino: st.st_ino,
+        mnt_id: None,
+        mode: st.st_mode.into(),
+        nlink: st.st_nlink.into(),
+    }
+}
+
+impl HostNodes for PassthroughFs {
+    fn host_node(&self, inode: Inode) -> io::Result<HostNode> {
+        let ihandle = self.inode_to_handle(inode, true)?;
+        let st = istat(&HOST_CTX, self.cfg.ownership(), &ihandle, true)?;
+        Ok(host_node(&st))
+    }
+
+    fn host_child(&self, parent: Inode, name: &CStr) -> io::Result<Option<HostNode>> {
+        let path = self.name_to_path(parent, name)?;
+        match lstat(&HOST_CTX, self.cfg.ownership(), &path, true) {
+            Ok(st) => Ok(Some(host_node(&st))),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn host_path(&self, inode: Inode) -> io::Result<Option<PathBuf>> {
+        let path = self.current_path(inode)?;
+        let root = self.current_path(fuse::ROOT_ID)?;
+        // Asked after the path, so a file removed while it was read back isn't given one.
+        if self.host_node(inode)?.nlink == 0 {
+            return Ok(None);
+        }
+        Ok(path.strip_prefix(root).ok().map(Path::to_path_buf))
     }
 }
 

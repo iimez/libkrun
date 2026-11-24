@@ -9,6 +9,9 @@ mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;
+// Windows has the policy types, for the API, but doesn't check requests against them yet.
+#[cfg_attr(not(unix), allow(dead_code))]
+mod policy;
 mod read_only;
 mod server;
 pub mod virtual_entry;
@@ -41,6 +44,7 @@ pub use self::device::Fs;
 #[cfg(unix)]
 pub use self::dynamic_root::DynamicShares;
 pub use self::filesystem::ExportTable;
+pub use self::policy::{FsObject, FsOp, FsPolicy, FsRequest, HostNode};
 
 /// Guest file-data caching policy for a host-backed virtio-fs filesystem.
 #[cfg_attr(
@@ -124,6 +128,8 @@ use descriptor_utils::Error as DescriptorError;
 pub enum FsError {
     /// The host does not implement the selected permission semantics.
     UnsupportedPermissionSemantics,
+    /// The device has no host directory to apply the request to.
+    NoHostDirectory,
     /// Failed to decode protocol messages.
     DecodeMessage(io::Error),
     /// Failed to encode protocol messages.

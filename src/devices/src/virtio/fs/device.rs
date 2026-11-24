@@ -22,6 +22,8 @@ use super::super::{
 use super::DynamicShares;
 use super::ExportTable;
 use super::passthrough;
+#[cfg(unix)]
+use super::policy::FsPolicy;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
 use super::{CachePolicy, PermissionSemantics, defs, defs::uapi};
@@ -61,6 +63,8 @@ pub struct Fs {
     read_only: bool,
     #[cfg(unix)]
     dynamic_shares: Option<DynamicShares>,
+    #[cfg(unix)]
+    policy: Option<Arc<dyn FsPolicy>>,
     virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -104,6 +108,8 @@ impl Fs {
             read_only,
             #[cfg(unix)]
             dynamic_shares: None,
+            #[cfg(unix)]
+            policy: None,
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
@@ -245,6 +251,16 @@ impl Fs {
         cfg.export_fsid
     }
 
+    /// Check the requests of the guest with `policy` before serving them.
+    #[cfg(unix)]
+    pub fn set_policy(&mut self, policy: Arc<dyn FsPolicy>) -> super::Result<()> {
+        if self.passthrough_cfg.is_none() || self.dynamic_shares.is_some() {
+            return Err(FsError::NoHostDirectory);
+        }
+        self.policy = Some(policy);
+        Ok(())
+    }
+
     pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
         self.virtual_entries.push(entry);
     }
@@ -340,6 +356,8 @@ impl VirtioDevice for Fs {
             self.read_only,
             #[cfg(unix)]
             self.dynamic_shares.clone(),
+            #[cfg(unix)]
+            self.policy.clone(),
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),

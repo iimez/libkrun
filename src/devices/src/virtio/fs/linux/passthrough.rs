@@ -5,11 +5,13 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map;
 use std::convert::TryInto;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io;
 use std::mem::{self, MaybeUninit, size_of};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,6 +28,7 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
+use super::super::policy::{HostNode, HostNodes};
 pub use super::super::{CachePolicy, PermissionSemantics};
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
@@ -2130,6 +2133,126 @@ impl FileSystem for PassthroughFs {
             _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
     }
+}
+
+impl PassthroughFs {
+    fn inode_data(&self, inode: Inode) -> io::Result<Arc<InodeData>> {
+        self.inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)
+    }
+
+    /// Where the host says `f` is now, in this process's view of the filesystem.
+    fn current_path(&self, f: &File) -> io::Result<PathBuf> {
+        let fd = CString::new(f.as_raw_fd().to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: the kernel writes at most `buf.len()` bytes to `buf`, and we check the result.
+        let res = unsafe {
+            libc::readlinkat(
+                self.proc_self_fd.as_raw_fd(),
+                fd.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(res as usize);
+        Ok(PathBuf::from(OsString::from_vec(buf)))
+    }
+}
+
+fn host_node((st, mnt_id): (libc::stat64, u64)) -> HostNode {
+    HostNode {
+        dev: st.st_dev,
+        ino: st.st_ino,
+        mnt_id: Some(mnt_id),
+        mode: st.st_mode,
+        nlink: st.st_nlink as _,
+    }
+}
+
+impl HostNodes for PassthroughFs {
+    fn host_node(&self, inode: Inode) -> io::Result<HostNode> {
+        Ok(host_node(statx(&self.inode_data(inode)?.file)?))
+    }
+
+    fn host_child(&self, parent: Inode, name: &CStr) -> io::Result<Option<HostNode>> {
+        let data = self.inode_data(parent)?;
+        // SAFETY: this doesn't modify any memory and we check the return value.
+        let fd = unsafe {
+            libc::openat(
+                data.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        // SAFETY: we just opened this fd.
+        let f = unsafe { File::from_raw_fd(fd) };
+        Ok(Some(host_node(statx(&f)?)))
+    }
+
+    fn host_path(&self, inode: Inode) -> io::Result<Option<PathBuf>> {
+        let data = self.inode_data(inode)?;
+        let root = self.inode_data(fuse::ROOT_ID)?;
+        let path = self.current_path(&data.file)?;
+        let Ok(relative) = path.strip_prefix(self.current_path(&root.file)?) else {
+            return Ok(None);
+        };
+        // Asked after the path, so a file removed while it was read back isn't given one.
+        let st = statx(&data.file)?.0;
+        if st.st_nlink == 0 {
+            return Ok(None);
+        }
+        // The kernel appends " (deleted)" to a name that was removed, even while the file has
+        // other names; a file may also really be called that. The path holds only if it still
+        // names this file.
+        if path.as_os_str().as_bytes().ends_with(b" (deleted)")
+            && !names_file(&root.file, relative, &st)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(relative.to_path_buf()))
+    }
+}
+
+/// Whether `relative`, under the directory `root`, names the file `st` describes.
+fn names_file(root: &File, relative: &Path, st: &libc::stat64) -> io::Result<bool> {
+    let relative = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut found = MaybeUninit::<libc::stat64>::zeroed();
+    // SAFETY: `relative` is a valid C string, the kernel writes at most a `stat64` to `found`, and
+    // we check the result.
+    let res = unsafe {
+        libc::fstatat64(
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            found.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if res < 0 {
+        let e = io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => Ok(false),
+            _ => Err(e),
+        };
+    }
+    // SAFETY: the kernel filled it in.
+    let found = unsafe { found.assume_init() };
+    Ok((found.st_dev, found.st_ino) == (st.st_dev, st.st_ino))
 }
 
 #[cfg(test)]

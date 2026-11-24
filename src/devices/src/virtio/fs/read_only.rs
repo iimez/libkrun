@@ -12,6 +12,8 @@
 use crossbeam_channel::Sender;
 use std::ffi::CStr;
 use std::io;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::time::Duration;
@@ -26,6 +28,8 @@ use super::filesystem::{
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
 use super::passthrough::{self, PassthroughFs};
+#[cfg(unix)]
+use super::policy::{HostNode, HostNodes};
 #[cfg(target_os = "windows")]
 use super::windows::fs_utils;
 use crate::virtio::bindings;
@@ -63,6 +67,21 @@ impl PassthroughFsRo {
         Ok(Self {
             inner: PassthroughFs::new(cfg, inode_alloc)?,
         })
+    }
+}
+
+#[cfg(unix)]
+impl HostNodes for PassthroughFsRo {
+    fn host_node(&self, inode: Inode) -> io::Result<HostNode> {
+        self.inner.host_node(inode)
+    }
+
+    fn host_child(&self, parent: Inode, name: &CStr) -> io::Result<Option<HostNode>> {
+        self.inner.host_child(parent, name)
+    }
+
+    fn host_path(&self, inode: Inode) -> io::Result<Option<PathBuf>> {
+        self.inner.host_path(inode)
     }
 }
 
