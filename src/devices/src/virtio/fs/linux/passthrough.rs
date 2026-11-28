@@ -172,6 +172,19 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
+/// Refuse a name a request carried that is not a single entry of a directory.
+///
+/// A name is resolved relative to the descriptor of its directory, so a `/` in it reaches an
+/// entry of another directory, one that starts with `/` an entry anywhere on the host, and `..`
+/// the directory above, which at the root is outside the shared directory.
+fn check_name(name: &CStr) -> io::Result<()> {
+    let bytes = name.to_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(einval());
+    }
+    Ok(())
+}
+
 fn stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -709,6 +722,7 @@ impl PassthroughFs {
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+        check_name(name)?;
         let data = self
             .inodes
             .read()
@@ -887,6 +901,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        check_name(name)?;
         let p = self
             .inodes
             .read()
@@ -1010,6 +1025,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        check_name(name)?;
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1064,14 +1080,9 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
+            // do_readdir passes each name without its NUL.
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = self.lookup(ctx, inode, &name)?;
 
             add_entry(dir_entry, entry)
         })
@@ -1111,6 +1122,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        check_name(name)?;
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1398,6 +1410,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        check_name(oldname)?;
+        check_name(newname)?;
         let old_inode = self
             .inodes
             .read()
@@ -1443,6 +1457,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        check_name(name)?;
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
@@ -1480,6 +1495,7 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
+        check_name(newname)?;
         let data = self
             .inodes
             .read()
@@ -1523,6 +1539,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        check_name(name)?;
         // Set security context on symlink.
         if extensions.secctx.is_some() {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
@@ -2258,7 +2275,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process;
 
     use super::*;
@@ -2373,21 +2390,28 @@ mod tests {
         pid: 0,
     };
 
-    /// A shared directory holding one entry, taken down with everything under it when a test
-    /// ends.
+    /// A shared directory holding one entry, with a file beside the share that no name
+    /// of an entry can reach. Taken down with everything under it when a test ends.
     struct Share {
         base: PathBuf,
         root: PathBuf,
+        outside: PathBuf,
     }
 
     impl Share {
         fn new(tag: &str) -> Share {
             let base = env::temp_dir().join(format!("libkrun-fs-{tag}-{}", process::id()));
             let root = base.join("share");
+            let outside = base.join("outside.txt");
             let _ = fs::remove_dir_all(&base);
             fs::create_dir_all(root.join("sub")).unwrap();
             fs::write(root.join("sub").join("inside.txt"), b"shared").unwrap();
-            Share { base, root }
+            fs::write(&outside, b"host").unwrap();
+            Share {
+                base,
+                root,
+                outside,
+            }
         }
 
         fn served(&self) -> PassthroughFs {
@@ -2430,5 +2454,124 @@ mod tests {
         .unwrap();
         let sub = fs::metadata(share.root.join("sub")).unwrap();
         assert_eq!(looked_up, [(b"sub".to_vec(), sub.ino())]);
+    }
+
+    fn name_of(path: &Path) -> CString {
+        CString::new(path.to_str().unwrap()).unwrap()
+    }
+
+    fn refused(result: io::Result<impl Sized>, what: &str) {
+        match result {
+            Ok(_) => panic!("{what}"),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{what}: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_entry_is_refused() {
+        for name in [c"a/b", c"a/", c"/etc", c"..", c".", c""] {
+            assert!(check_name(name).is_err(), "{name:?}");
+        }
+        for name in [c"a", c".a", c"..a", c"a.."] {
+            assert!(check_name(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_stays_within_the_shared_directory() {
+        let share = Share::new("lookup");
+        let fs = share.served();
+
+        refused(
+            fs.lookup(CTX, fuse::ROOT_ID, c".."),
+            "`..` at the root reached the directory above the share",
+        );
+        refused(
+            fs.lookup(CTX, fuse::ROOT_ID, c"sub/inside.txt"),
+            "a separator in a name reached an entry of another directory",
+        );
+        refused(
+            fs.lookup(CTX, fuse::ROOT_ID, &name_of(&share.outside)),
+            "a name spelling a host path reached a file outside the share",
+        );
+    }
+
+    #[test]
+    fn a_name_that_escapes_changes_nothing_outside_the_share() {
+        let share = Share::new("change");
+        let fs = share.served();
+        let sub = fs.lookup(CTX, fuse::ROOT_ID, c"sub").unwrap().inode;
+        let ext = Extensions::default;
+        let made = c"../made";
+
+        refused(
+            fs.create(CTX, fuse::ROOT_ID, made, 0o644, false, 0, 0, ext()),
+            "create",
+        );
+        refused(fs.mkdir(CTX, fuse::ROOT_ID, made, 0o755, 0, ext()), "mkdir");
+        refused(
+            fs.mknod(CTX, fuse::ROOT_ID, made, libc::S_IFIFO | 0o644, 0, 0, ext()),
+            "mknod",
+        );
+        refused(
+            fs.symlink(CTX, c"sub", fuse::ROOT_ID, made, ext()),
+            "symlink",
+        );
+        refused(fs.link(CTX, sub, fuse::ROOT_ID, made), "link");
+        refused(
+            fs.rename(CTX, fuse::ROOT_ID, c"sub", fuse::ROOT_ID, made, 0),
+            "rename to",
+        );
+        refused(
+            fs.rename(
+                CTX,
+                fuse::ROOT_ID,
+                c"../outside.txt",
+                fuse::ROOT_ID,
+                c"taken",
+                0,
+            ),
+            "rename from",
+        );
+        refused(fs.unlink(CTX, fuse::ROOT_ID, c"../outside.txt"), "unlink");
+        refused(fs.rmdir(CTX, sub, c"../sub"), "rmdir");
+
+        assert!(!share.base.join("made").exists());
+        assert!(!share.root.join("taken").exists());
+        assert_eq!(fs::read(&share.outside).unwrap(), b"host");
+        assert!(share.root.join("sub").is_dir());
+    }
+
+    #[test]
+    fn readdirplus_looks_up_each_entry_by_its_whole_name() {
+        let share = Share::new("readdirplus");
+        fs::write(share.root.join("a"), b"").unwrap();
+        fs::write(share.root.join(".b"), b"").unwrap();
+        let fs = share.served();
+        let (handle, _) = fs.opendir(CTX, fuse::ROOT_ID, 0).unwrap();
+
+        let mut looked_up = Vec::new();
+        fs.readdirplus(
+            CTX,
+            fuse::ROOT_ID,
+            handle.unwrap(),
+            4096,
+            0,
+            |entry, found| {
+                looked_up.push((entry.name.to_vec(), found.attr.st_ino));
+                Ok(1)
+            },
+        )
+        .unwrap();
+        looked_up.sort();
+        let ino = |name| fs::metadata(share.root.join(name)).unwrap().ino();
+        assert_eq!(
+            looked_up,
+            [
+                (b".b".to_vec(), ino(".b")),
+                (b"a".to_vec(), ino("a")),
+                (b"sub".to_vec(), ino("sub")),
+            ]
+        );
     }
 }
