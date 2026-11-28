@@ -825,7 +825,9 @@ impl FsDevice<'_> {
     /// changes extended attributes, and a refusal fails the request with the errno it returns.
     /// Lookups and attributes are not checked, so the guest still sees every name and its size.
     /// Reads and writes through a handle are not checked again: a handle opened before the
-    /// policy changes its mind keeps the access it was opened with.
+    /// policy changes its mind keeps the access it was opened with. The policy may also defer a
+    /// request and answer it later, while the device serves the others: see [`FsPolicy`] for
+    /// how, and what that costs the guest.
     ///
     /// The policy may decide differently from one request to the next, through state the
     /// embedder keeps and changes while the VM runs. A file the guest already read may stay
