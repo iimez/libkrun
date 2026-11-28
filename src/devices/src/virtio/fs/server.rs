@@ -26,6 +26,7 @@ use super::filesystem::{
 };
 use super::fs_utils::einval;
 use super::fuse::*;
+use super::policy::DeferredRequest;
 use super::{FsError as Error, Result};
 use crate::virtio::VirtioShmRegion;
 
@@ -1490,7 +1491,12 @@ fn reply_ok<T: ByteValued>(
     Ok(w.bytes_written())
 }
 
-fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+pub(super) fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+    let e = match e.downcast::<DeferredRequest>() {
+        // Left unanswered: the device answers it when it serves it again.
+        Ok(request) => return Err(Error::Deferred { request, unique }),
+        Err(e) => e,
+    };
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
         error: -e.raw_os_error().unwrap_or(libc::EIO),

@@ -1324,7 +1324,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         use std::sync::Mutex;
 
-        use crate::virtio::fs::policy::{FsOp, FsPolicy, FsRequest, FsVerdict, PolicyFs};
+        use crate::virtio::fs::policy::{
+            Deferrals, FsOp, FsPolicy, FsRequest, FsVerdict, PolicyFs,
+        };
 
         type Seen = (Option<PathBuf>, Option<(u64, u64)>);
         struct Record(Mutex<Vec<Seen>>);
@@ -1352,6 +1354,7 @@ mod tests {
         let fs = PolicyFs::new(
             DynamicRootFs::new(passthrough::Config::default(), &shares),
             record.clone(),
+            Arc::new(Deferrals::new().unwrap()),
         );
         fs.init(FsOptions::empty()).unwrap();
         let lookup = |parent, name: &str| {

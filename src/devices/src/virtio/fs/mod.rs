@@ -44,7 +44,9 @@ pub use self::device::Fs;
 #[cfg(unix)]
 pub use self::dynamic_root::DynamicShares;
 pub use self::filesystem::ExportTable;
-pub use self::policy::{FsObject, FsOp, FsPolicy, FsRequest, FsVerdict, HostNode};
+pub use self::policy::{
+    FsDeferral, FsObject, FsOp, FsPolicy, FsRequest, FsRequestId, FsVerdict, HostNode,
+};
 
 /// Guest file-data caching policy for a host-backed virtio-fs filesystem.
 #[cfg_attr(
@@ -150,6 +152,11 @@ pub enum FsError {
     InvalidXattrSize((u32, usize)),
     QueueReader(DescriptorError),
     QueueWriter(DescriptorError),
+    /// The policy deferred the request, which has no reply yet.
+    Deferred {
+        request: policy::DeferredRequest,
+        unique: u64,
+    },
 }
 
 type Result<T> = std::result::Result<T, FsError>;

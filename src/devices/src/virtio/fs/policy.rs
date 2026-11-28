@@ -11,19 +11,23 @@
 //   them would only leak.
 
 use std::cell::OnceCell;
-use std::ffi::CStr;
+use std::error::Error;
 #[cfg(unix)]
 use std::ffi::OsStr;
+use std::ffi::{CStr, CString};
+use std::fmt;
 use std::io;
+use std::mem;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
@@ -96,6 +100,9 @@ pub enum FsVerdict {
     /// Fail the request with this errno, a positive Linux errno value as the guest sees it, such
     /// as `EACCES` (13) or `EROFS` (30). 0 or a negative value fails it with `EACCES`.
     Deny(i32),
+    /// Leave the request unanswered until the embedder says it is decided, through
+    /// [`FsRequest::deferral`].
+    Defer,
 }
 
 /// A policy that decides which requests of a virtio-fs share go through.
@@ -104,9 +111,138 @@ pub enum FsVerdict {
 /// should return quickly; while it runs, the share serves nothing else. The embedder may change
 /// what it decides at any time, through state of its own: each request is decided when it
 /// arrives.
+///
+/// A policy that needs longer to decide returns [`FsVerdict::Defer`], keeps the request's
+/// [`id`](FsRequest::id) and [`deferral`](FsRequest::deferral), and calls
+/// [`FsDeferral::decided`] once it knows the answer. The share goes on serving every other
+/// request meanwhile. The deferred request is then checked again, with the same id unless the
+/// guest changed the request while it waited, and the policy answers it or defers it again.
+/// A device holds at most 64 deferred requests; it fails any more at once with `EACCES`, and
+/// drops those it holds when the guest resets it.
+///
+/// Any request may be deferred, but a deferred request costs the guest more than its wait. The
+/// guest process that made it can't be killed until it is answered, as the guest sends no
+/// interrupt for it. A request that creates, removes, renames or links a name holds the lock of
+/// its directory in the guest's kernel, so every other process in the guest that creates a
+/// name there, or looks up a name there that it hasn't cached, waits for the answer too; an
+/// open of an existing file holds no such lock.
 pub trait FsPolicy: Send + Sync {
     /// Decide whether `request` goes through.
     fn check(&self, request: &FsRequest) -> FsVerdict;
+}
+
+/// Tells one request apart from every other a [`FsPolicy`] is asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FsRequestId(u64);
+
+impl FsRequestId {
+    fn next() -> Self {
+        // Process-wide, so that a policy shared by devices, or kept across a device reset, never
+        // sees an id twice.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Says that a request a [`FsPolicy`] deferred is decided.
+#[derive(Clone)]
+pub struct FsDeferral {
+    id: FsRequestId,
+    deferrals: Weak<Deferrals>,
+}
+
+impl FsDeferral {
+    /// Check the deferred request again, from any thread. It does nothing for a request that
+    /// is no longer held: one already answered, or failed for being over the bound, or dropped
+    /// by a reset.
+    pub fn decided(&self) {
+        if let Some(deferrals) = self.deferrals.upgrade() {
+            deferrals.decided.lock().unwrap().push(self.id);
+            if let Err(e) = deferrals.event.write(1) {
+                error!("virtio-fs policy: can't wake the device for a decided request: {e}");
+            }
+        }
+    }
+}
+
+/// The requests a device's policy deferred, shared by the policy's filesystem and the worker
+/// that holds them.
+pub(crate) struct Deferrals {
+    /// Written when a request is decided.
+    pub(crate) event: EventFd,
+    decided: Mutex<Vec<FsRequestId>>,
+    again: Mutex<Option<DeferredRequest>>,
+}
+
+impl Deferrals {
+    pub(crate) fn new() -> io::Result<Self> {
+        Ok(Self {
+            event: EventFd::new(EFD_NONBLOCK)?,
+            decided: Mutex::new(Vec::new()),
+            again: Mutex::new(None),
+        })
+    }
+
+    /// The requests decided since the last call.
+    pub(crate) fn take_decided(&self) -> Vec<FsRequestId> {
+        mem::take(&mut self.decided.lock().unwrap())
+    }
+
+    /// Check `request` again: the next request the policy is asked about keeps its id if the
+    /// guest sent the same request again.
+    pub(crate) fn check_again(&self, request: Option<DeferredRequest>) {
+        *self.again.lock().unwrap() = request;
+    }
+}
+
+/// A request a [`FsPolicy`] deferred, as the policy was asked about it.
+#[derive(Debug)]
+pub struct DeferredRequest {
+    id: FsRequestId,
+    asked: Asked,
+}
+
+impl DeferredRequest {
+    pub(crate) fn id(&self) -> FsRequestId {
+        self.id
+    }
+}
+
+impl fmt::Display for DeferredRequest {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "request {} deferred by the policy", self.id.0)
+    }
+}
+
+impl Error for DeferredRequest {}
+
+/// What a policy sees of a request, to tell whether a deferred request is the same when it is
+/// checked again: the guest may have changed it while it waited.
+#[derive(Debug, PartialEq, Eq)]
+struct Asked {
+    op: FsOp,
+    uid: u32,
+    gid: u32,
+    pid: i32,
+    flags: u32,
+    object: AskedPlace,
+    target: Option<AskedPlace>,
+    xattr_name: Option<CString>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AskedPlace {
+    Node(Inode),
+    Entry(Inode, CString),
+}
+
+impl From<Place<'_>> for AskedPlace {
+    fn from(place: Place) -> Self {
+        match place {
+            Place::Node(inode) => Self::Node(inode),
+            Place::Entry { parent, name } => Self::Entry(parent, name.to_owned()),
+        }
+    }
 }
 
 /// What the host knows about the files a node ID or a name stands for.
@@ -220,15 +356,31 @@ fn component(name: &CStr) -> Option<&Path> {
 
 /// A request a [`FsPolicy`] is asked about.
 pub struct FsRequest<'a> {
+    id: FsRequestId,
     op: FsOp,
     ctx: Context,
     flags: u32,
     object: FsObject<'a>,
     target: Option<FsObject<'a>>,
     xattr_name: Option<&'a CStr>,
+    deferrals: &'a Arc<Deferrals>,
 }
 
 impl<'a> FsRequest<'a> {
+    /// Tells the request apart from the others. A deferred request has the same id each time
+    /// it is checked again, as long as the guest sends the same request.
+    pub fn id(&self) -> FsRequestId {
+        self.id
+    }
+
+    /// What a policy that defers the request calls once it is decided.
+    pub fn deferral(&self) -> FsDeferral {
+        FsDeferral {
+            id: self.id,
+            deferrals: Arc::downgrade(self.deferrals),
+        }
+    }
+
     pub fn op(&self) -> FsOp {
         self.op
     }
@@ -274,11 +426,18 @@ impl<'a> FsRequest<'a> {
 pub struct PolicyFs<T> {
     inner: T,
     policy: Arc<dyn FsPolicy>,
+    deferrals: Arc<Deferrals>,
 }
 
 impl<T: FileSystem<Inode = Inode, Handle = Handle> + HostNodes> PolicyFs<T> {
-    pub fn new(inner: T, policy: Arc<dyn FsPolicy>) -> Self {
-        Self { inner, policy }
+    /// A request `policy` defers fails with a [`DeferredRequest`] error, for the device to hold
+    /// and to check again through `deferrals`.
+    pub fn new(inner: T, policy: Arc<dyn FsPolicy>, deferrals: Arc<Deferrals>) -> Self {
+        Self {
+            inner,
+            policy,
+            deferrals,
+        }
     }
 
     fn check(
@@ -289,14 +448,7 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle> + HostNodes> PolicyFs<T> {
         object: Place,
         target: Option<Place>,
     ) -> io::Result<()> {
-        self.ask(FsRequest {
-            op,
-            ctx,
-            flags,
-            object: FsObject::new(&self.inner, object),
-            target: target.map(|place| FsObject::new(&self.inner, place)),
-            xattr_name: None,
-        })
+        self.ask(ctx, op, flags, object, target, None)
     }
 
     fn check_xattr(
@@ -307,21 +459,47 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle> + HostNodes> PolicyFs<T> {
         inode: Inode,
         name: Option<&CStr>,
     ) -> io::Result<()> {
-        self.ask(FsRequest {
+        self.ask(ctx, op, flags, Place::Node(inode), None, name)
+    }
+
+    fn ask(
+        &self,
+        ctx: Context,
+        op: FsOp,
+        flags: u32,
+        object: Place,
+        target: Option<Place>,
+        xattr_name: Option<&CStr>,
+    ) -> io::Result<()> {
+        let asked = || Asked {
+            op,
+            uid: ctx.uid,
+            gid: ctx.gid,
+            pid: ctx.pid,
+            flags,
+            object: object.into(),
+            target: target.map(Into::into),
+            xattr_name: xattr_name.map(CStr::to_owned),
+        };
+        let id = match self.deferrals.again.lock().unwrap().take() {
+            Some(deferred) if deferred.asked == asked() => deferred.id,
+            _ => FsRequestId::next(),
+        };
+        let request = FsRequest {
+            id,
             op,
             ctx,
             flags,
-            object: FsObject::new(&self.inner, Place::Node(inode)),
-            target: None,
-            xattr_name: name,
-        })
-    }
-
-    fn ask(&self, request: FsRequest) -> io::Result<()> {
+            object: FsObject::new(&self.inner, object),
+            target: target.map(|place| FsObject::new(&self.inner, place)),
+            xattr_name,
+            deferrals: &self.deferrals,
+        };
         match self.policy.check(&request) {
             FsVerdict::Allow => Ok(()),
             FsVerdict::Deny(errno) if errno > 0 => Err(io::Error::from_raw_os_error(errno)),
             FsVerdict::Deny(_) => Err(linux_errno::eacces()),
+            FsVerdict::Defer => Err(io::Error::other(DeferredRequest { id, asked: asked() })),
         }
     }
 }
@@ -799,6 +977,7 @@ mod tests {
     struct Share {
         dir: PathBuf,
         rules: Arc<Rules>,
+        deferrals: Arc<Deferrals>,
         fs: PolicyFs<PassthroughFs>,
     }
 
@@ -816,9 +995,15 @@ mod tests {
             };
             let inner = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
             let rules = Arc::new(Rules(RwLock::new(Box::new(|_| FsVerdict::Allow))));
-            let fs = PolicyFs::new(inner, rules.clone());
+            let deferrals = Arc::new(Deferrals::new().unwrap());
+            let fs = PolicyFs::new(inner, rules.clone(), deferrals.clone());
             fs.init(FsOptions::empty()).unwrap();
-            Share { dir, rules, fs }
+            Share {
+                dir,
+                rules,
+                deferrals,
+                fs,
+            }
         }
 
         fn rule(&self, rule: impl Fn(&FsRequest) -> FsVerdict + Send + Sync + 'static) {
@@ -1252,5 +1437,58 @@ mod tests {
         let after = share.open("file", libc::O_WRONLY).unwrap();
         write(after, b"c").unwrap();
         share.create("new").unwrap();
+    }
+
+    #[test]
+    fn a_deferred_request_keeps_its_id_only_while_it_is_the_same() {
+        let share = Share::new("deferred");
+        let ids = Arc::new(RwLock::new(Vec::new()));
+        let record = ids.clone();
+        share.rule(move |request| {
+            record.write().unwrap().push(request.id());
+            FsVerdict::Defer
+        });
+        let dir = share.inode("dir");
+        let create = |parent, name: &CStr, flags: i32| {
+            let result = share.fs.create(
+                ctx(),
+                parent,
+                name,
+                0o644,
+                false,
+                flags as u32,
+                0,
+                Extensions::default(),
+            );
+            result
+                .map(drop)
+                .unwrap_err()
+                .downcast::<DeferredRequest>()
+                .unwrap()
+        };
+        let again = |request: DeferredRequest| share.deferrals.check_again(Some(request));
+
+        let first = create(fuse::ROOT_ID, c"new", libc::O_WRONLY);
+        again(first);
+        let same = create(fuse::ROOT_ID, c"new", libc::O_WRONLY);
+        again(same);
+        let renamed = create(fuse::ROOT_ID, c"other", libc::O_WRONLY);
+        again(renamed);
+        let moved = create(dir, c"other", libc::O_WRONLY);
+        again(moved);
+        let reflagged = create(dir, c"other", libc::O_RDWR);
+        let fresh = create(dir, c"other", libc::O_RDWR);
+
+        let ids = ids.read().unwrap();
+        assert_eq!(ids[0], ids[1], "the same request got a new id");
+        for i in 2..ids.len() {
+            assert!(
+                !ids[..i].contains(&ids[i]),
+                "request {i} took an earlier id"
+            );
+        }
+        assert_eq!(fresh.id(), ids[5]);
+        assert_eq!(reflagged.id(), ids[4]);
+        assert!(!share.dir.join("new").exists());
     }
 }
