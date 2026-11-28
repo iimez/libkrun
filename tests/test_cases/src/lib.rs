@@ -86,6 +86,18 @@ mod test_virtiofs_policy;
 ))]
 use test_virtiofs_policy::TestVirtiofsPolicy;
 
+// The policy has no C API either.
+#[cfg(all(
+    any(feature = "host", target_os = "linux"),
+    not(feature = "dynamic-linking")
+))]
+mod test_virtiofs_deferred;
+#[cfg(all(
+    any(feature = "host", target_os = "linux"),
+    not(feature = "dynamic-linking")
+))]
+use test_virtiofs_deferred::TestVirtiofsDeferred;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -307,6 +319,11 @@ pub fn test_cases() -> Vec<TestCase> {
             not(feature = "dynamic-linking")
         ))]
         TestCase::new("virtiofs-policy", Box::new(TestVirtiofsPolicy)),
+        #[cfg(all(
+            any(feature = "host", target_os = "linux"),
+            not(feature = "dynamic-linking")
+        ))]
+        TestCase::new("virtiofs-deferred", Box::new(TestVirtiofsDeferred)),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         TestCase::new("virtio-pci", Box::new(TestVirtioPci)),
         #[cfg(target_os = "linux")]
