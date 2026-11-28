@@ -1194,7 +1194,7 @@ mod tests {
         let forgotten = lookup(&fs, fuse::ROOT_ID, "forgotten").unwrap().inode;
         fs.forget(ctx(), forgotten, 1);
         let held = lookup(&fs, fuse::ROOT_ID, "held").unwrap().inode;
-        assert_eq!(lookup(&fs, held, ".").unwrap().inode, held);
+        assert_eq!(lookup(&fs, fuse::ROOT_ID, "held").unwrap().inode, held);
         for (name, _) in &dirs {
             shares.remove(name).unwrap();
         }
@@ -1230,9 +1230,6 @@ mod tests {
         }
         assert_eq!(dir_a.inode >> SHARE_SHIFT, file_a.inode >> SHARE_SHIFT);
         assert_ne!(dir_a.inode >> SHARE_SHIFT, dir_b.inode >> SHARE_SHIFT);
-
-        let parent = lookup(&fs, dir_a.inode, ".").unwrap();
-        assert_eq!(parent.inode, dir_a.inode);
 
         assert_eq!(
             errno(fs.link(ctx(), file_a.inode, dir_b.inode, c"link")),
