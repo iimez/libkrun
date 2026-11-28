@@ -329,7 +329,8 @@ pub struct Context {
     /// The group ID of the calling process.
     pub gid: libc::gid_t,
 
-    /// The thread group ID of the calling process.
+    /// The thread ID of the calling thread, which is the process ID only for a process's main
+    /// thread.
     pub pid: libc::pid_t,
 }
 
@@ -342,7 +343,8 @@ pub struct Context {
     /// The group ID of the calling process.
     pub gid: u32,
 
-    /// The thread group ID of the calling process.
+    /// The thread ID of the calling thread, which is the process ID only for a process's main
+    /// thread.
     pub pid: i32,
 }
 

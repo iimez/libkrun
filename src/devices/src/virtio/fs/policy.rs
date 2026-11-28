@@ -235,7 +235,8 @@ impl<'a> FsRequest<'a> {
         self.ctx.gid
     }
 
-    /// The thread group ID, in the guest, of the process that made the request.
+    /// The thread ID, in the guest, of the thread that made the request. It is the process ID
+    /// only for a process's main thread: FUSE doesn't send the thread group ID.
     pub fn pid(&self) -> i32 {
         self.ctx.pid
     }
