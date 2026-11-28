@@ -31,8 +31,6 @@ use super::super::multikey::MultikeyBTreeMap;
 use super::super::policy::{HostNode, HostNodes};
 pub use super::super::{CachePolicy, PermissionSemantics};
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 
@@ -590,7 +588,7 @@ impl PassthroughFs {
                 .position(|&a| a == 0)
                 .expect("LinuxDirent64 name not NUL-terminated");
             let name = &name[..term];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
+            let res = if name == b"." || name == b".." {
                 // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
                 // break the loop so return `Ok` with a non-zero value instead.
                 Ok(1)
@@ -2257,6 +2255,12 @@ fn names_file(root: &File, relative: &Path, st: &libc::stat64) -> io::Result<boo
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::process;
+
     use super::*;
 
     // A non-zero uid the server can be made to run as, plus a guest
@@ -2361,5 +2365,70 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    const CTX: Context = Context {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+
+    /// A shared directory holding one entry, taken down with everything under it when a test
+    /// ends.
+    struct Share {
+        base: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Share {
+        fn new(tag: &str) -> Share {
+            let base = env::temp_dir().join(format!("libkrun-fs-{tag}-{}", process::id()));
+            let root = base.join("share");
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("sub").join("inside.txt"), b"shared").unwrap();
+            Share { base, root }
+        }
+
+        fn served(&self) -> PassthroughFs {
+            let cfg = Config {
+                root_dir: self.root.to_str().unwrap().to_owned(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            fs
+        }
+    }
+
+    impl Drop for Share {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn a_listing_holds_only_the_entries_of_the_directory() {
+        let share = Share::new("listing");
+        let fs = share.served();
+        let (handle, _) = fs.opendir(CTX, fuse::ROOT_ID, 0).unwrap();
+        let handle = handle.unwrap();
+
+        let mut listed = Vec::new();
+        fs.readdir(CTX, fuse::ROOT_ID, handle, 4096, 0, |entry| {
+            listed.push(entry.name.to_vec());
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(listed, [b"sub"]);
+
+        let mut looked_up = Vec::new();
+        fs.readdirplus(CTX, fuse::ROOT_ID, handle, 4096, 0, |entry, found| {
+            looked_up.push((entry.name.to_vec(), found.attr.st_ino));
+            Ok(1)
+        })
+        .unwrap();
+        let sub = fs::metadata(share.root.join("sub")).unwrap();
+        assert_eq!(looked_up, [(b"sub".to_vec(), sub.ino())]);
     }
 }
