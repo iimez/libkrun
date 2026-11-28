@@ -170,6 +170,19 @@ fn einval() -> io::Error {
     linux_error(io::Error::from_raw_os_error(libc::EINVAL))
 }
 
+/// Refuse a name a request carried that is not a single entry of a directory.
+///
+/// A name is resolved as the last part of a path under its directory, so a `/` in it reaches an
+/// entry of another directory, and `..` the directory above, which at the root is outside the
+/// shared directory.
+fn check_name(name: &CStr) -> io::Result<()> {
+    let bytes = name.to_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(einval());
+    }
+    Ok(())
+}
+
 fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
     match std::str::from_utf8(item) {
         Ok(val) => match u32::from_str_radix(val, radix) {
@@ -720,6 +733,7 @@ impl PassthroughFs {
     }
 
     fn name_to_path(&self, parent: Inode, name: &CStr) -> io::Result<CString> {
+        check_name(name)?;
         debug!(
             "name_to_path: parent={} name={}",
             parent,
@@ -1014,6 +1028,7 @@ impl PassthroughFs {
         name: &CStr,
         flags: libc::c_int,
     ) -> io::Result<()> {
+        check_name(name)?;
         let ihandle = self.inode_to_handle(parent, true)?;
 
         let (fd, close_fd) = match ihandle {
@@ -3203,5 +3218,134 @@ mod tests {
         )));
         // A list that fails or doesn't fit sends the caller to ask directly.
         assert!(has_override_xattr(|_, _| -1));
+    }
+
+    /// A shared directory holding one entry, with a file beside the share that no name of an
+    /// entry can reach. Taken down with everything under it when a test ends.
+    struct ShareBesideAFile {
+        base: PathBuf,
+        root: PathBuf,
+        outside: PathBuf,
+        fs: PassthroughFs,
+    }
+
+    impl ShareBesideAFile {
+        fn new(tag: &str) -> Self {
+            let base =
+                std::env::temp_dir().join(format!("libkrun-fs-{tag}-{}", std::process::id()));
+            let root = base.join("share");
+            let outside = base.join("outside.txt");
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("sub").join("inside.txt"), b"shared").unwrap();
+            fs::write(&outside, b"host").unwrap();
+            let cfg = Config {
+                root_dir: root.to_str().unwrap().to_string(),
+                ..Default::default()
+            };
+            let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            Self {
+                base,
+                root,
+                outside,
+                fs,
+            }
+        }
+    }
+
+    impl Drop for ShareBesideAFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn refused(result: io::Result<impl Sized>, what: &str) {
+        match result {
+            Ok(_) => panic!("{what}"),
+            Err(e) => assert_eq!(e.raw_os_error(), einval().raw_os_error(), "{what}: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_entry_is_refused() {
+        for name in [c"a/b", c"a/", c"/etc", c"..", c".", c""] {
+            assert!(check_name(name).is_err(), "{name:?}");
+        }
+        for name in [c"a", c".a", c"..a", c"a.."] {
+            assert!(check_name(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_stays_within_the_shared_directory() {
+        let share = ShareBesideAFile::new("lookup");
+
+        refused(
+            share.fs.lookup(CTX, fuse::ROOT_ID, c".."),
+            "`..` at the root reached the directory above the share",
+        );
+        refused(
+            share.fs.lookup(CTX, fuse::ROOT_ID, c"sub/inside.txt"),
+            "a separator in a name reached an entry of another directory",
+        );
+        refused(
+            share.fs.lookup(CTX, fuse::ROOT_ID, c"../outside.txt"),
+            "a name reached a file outside the share",
+        );
+    }
+
+    #[test]
+    fn a_name_that_escapes_changes_nothing_outside_the_share() {
+        let share = ShareBesideAFile::new("change");
+        let fs = &share.fs;
+        let sub = fs.lookup(CTX, fuse::ROOT_ID, c"sub").unwrap().inode;
+        let ext = Extensions::default;
+        let made = c"../made";
+
+        refused(
+            fs.create(CTX, fuse::ROOT_ID, made, 0o644, false, 0, 0, ext()),
+            "create",
+        );
+        refused(fs.mkdir(CTX, fuse::ROOT_ID, made, 0o755, 0, ext()), "mkdir");
+        refused(
+            fs.mknod(
+                CTX,
+                fuse::ROOT_ID,
+                made,
+                u32::from(libc::S_IFIFO) | 0o644,
+                0,
+                0,
+                ext(),
+            ),
+            "mknod",
+        );
+        refused(
+            fs.symlink(CTX, c"sub", fuse::ROOT_ID, made, ext()),
+            "symlink",
+        );
+        refused(fs.link(CTX, sub, fuse::ROOT_ID, made), "link");
+        refused(
+            fs.rename(CTX, fuse::ROOT_ID, c"sub", fuse::ROOT_ID, made, 0),
+            "rename to",
+        );
+        refused(
+            fs.rename(
+                CTX,
+                fuse::ROOT_ID,
+                c"../outside.txt",
+                fuse::ROOT_ID,
+                c"taken",
+                0,
+            ),
+            "rename from",
+        );
+        refused(fs.unlink(CTX, fuse::ROOT_ID, c"../outside.txt"), "unlink");
+        refused(fs.rmdir(CTX, sub, c"../sub"), "rmdir");
+
+        assert!(!share.base.join("made").exists());
+        assert!(!share.root.join("taken").exists());
+        assert_eq!(fs::read(&share.outside).unwrap(), b"host");
+        assert!(share.root.join("sub").is_dir());
     }
 }
