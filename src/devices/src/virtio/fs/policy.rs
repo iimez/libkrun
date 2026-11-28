@@ -88,6 +88,16 @@ pub enum FsOp {
     Removexattr,
 }
 
+/// What a [`FsPolicy`] decides about a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsVerdict {
+    /// Let the request through.
+    Allow,
+    /// Fail the request with this errno, a positive Linux errno value as the guest sees it, such
+    /// as `EACCES` (13) or `EROFS` (30). 0 or a negative value fails it with `EACCES`.
+    Deny(i32),
+}
+
 /// A policy that decides which requests of a virtio-fs share go through.
 ///
 /// `check` runs on the device's worker thread before each request it is asked about, so it
@@ -95,10 +105,8 @@ pub enum FsOp {
 /// what it decides at any time, through state of its own: each request is decided when it
 /// arrives.
 pub trait FsPolicy: Send + Sync {
-    /// Return `Ok(())` to let the request through, or `Err(errno)` to fail it with `errno`, a
-    /// positive Linux errno value as the guest sees it, such as `EACCES` (13) or `EROFS` (30).
-    /// `Err` with 0 or a negative value fails the request with `EACCES`.
-    fn check(&self, request: &FsRequest) -> Result<(), i32>;
+    /// Decide whether `request` goes through.
+    fn check(&self, request: &FsRequest) -> FsVerdict;
 }
 
 /// What the host knows about the files a node ID or a name stands for.
@@ -310,13 +318,11 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle> + HostNodes> PolicyFs<T> {
     }
 
     fn ask(&self, request: FsRequest) -> io::Result<()> {
-        self.policy.check(&request).map_err(|errno| {
-            if errno > 0 {
-                io::Error::from_raw_os_error(errno)
-            } else {
-                linux_errno::eacces()
-            }
-        })
+        match self.policy.check(&request) {
+            FsVerdict::Allow => Ok(()),
+            FsVerdict::Deny(errno) if errno > 0 => Err(io::Error::from_raw_os_error(errno)),
+            FsVerdict::Deny(_) => Err(linux_errno::eacces()),
+        }
     }
 }
 
@@ -780,12 +786,12 @@ mod tests {
     // Distinct from anything the passthrough returns, so a refusal is told apart.
     const REFUSED: i32 = 125;
 
-    type Rule = Box<dyn Fn(&FsRequest) -> Result<(), i32> + Send + Sync>;
+    type Rule = Box<dyn Fn(&FsRequest) -> FsVerdict + Send + Sync>;
 
     struct Rules(RwLock<Rule>);
 
     impl FsPolicy for Rules {
-        fn check(&self, request: &FsRequest) -> Result<(), i32> {
+        fn check(&self, request: &FsRequest) -> FsVerdict {
             (self.0.read().unwrap())(request)
         }
     }
@@ -809,13 +815,13 @@ mod tests {
                 ..Default::default()
             };
             let inner = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
-            let rules = Arc::new(Rules(RwLock::new(Box::new(|_| Ok(())))));
+            let rules = Arc::new(Rules(RwLock::new(Box::new(|_| FsVerdict::Allow))));
             let fs = PolicyFs::new(inner, rules.clone());
             fs.init(FsOptions::empty()).unwrap();
             Share { dir, rules, fs }
         }
 
-        fn rule(&self, rule: impl Fn(&FsRequest) -> Result<(), i32> + Send + Sync + 'static) {
+        fn rule(&self, rule: impl Fn(&FsRequest) -> FsVerdict + Send + Sync + 'static) {
             *self.rules.0.write().unwrap() = Box::new(rule);
         }
 
@@ -968,9 +974,9 @@ mod tests {
             let share = Share::new(&format!("refused-{op:?}"));
             share.rule(move |request| {
                 if request.op() == op {
-                    Err(REFUSED)
+                    FsVerdict::Deny(REFUSED)
                 } else {
-                    Ok(())
+                    FsVerdict::Allow
                 }
             });
             assert!(refused(run(&share, op)), "{op:?} went through");
@@ -1007,7 +1013,7 @@ mod tests {
                 target.and_then(|t| t.path().map(Path::to_path_buf)),
                 target.and_then(|t| t.node().map(identity)),
             ));
-            Ok(())
+            FsVerdict::Allow
         });
         let file = fs::metadata(share.dir.join("file")).unwrap();
         let root = fs::metadata(&share.dir).unwrap();
@@ -1060,7 +1066,7 @@ mod tests {
                 .write()
                 .unwrap()
                 .push(request.object().path().map(Path::to_path_buf));
-            Ok(())
+            FsVerdict::Allow
         });
         let file = share.inode("file");
         let dir = share.inode("dir");
@@ -1093,7 +1099,7 @@ mod tests {
                 .write()
                 .unwrap()
                 .push(request.object().path().map(Path::to_path_buf));
-            Ok(())
+            FsVerdict::Allow
         });
         fs::hard_link(share.dir.join("file"), share.dir.join("other")).unwrap();
         fs::write(share.dir.join("real (deleted)"), b"").unwrap();
@@ -1114,7 +1120,7 @@ mod tests {
     #[test]
     fn lookups_and_attributes_are_not_checked() {
         let share = Share::new("unchecked");
-        share.rule(|_| Err(REFUSED));
+        share.rule(|_| FsVerdict::Deny(REFUSED));
         let entry = share.lookup(fuse::ROOT_ID, "file").unwrap();
         assert_eq!(entry.attr.st_size, 8);
         share.fs.getattr(ctx(), entry.inode, None).unwrap();
@@ -1135,9 +1141,9 @@ mod tests {
                 .flatten()
                 .any(|object| object.node().map(identity) == Some(protected))
             {
-                return Err(REFUSED);
+                return FsVerdict::Deny(REFUSED);
             }
-            Ok(())
+            FsVerdict::Allow
         });
 
         assert!(refused(share.open("alias", libc::O_RDWR)));
@@ -1163,9 +1169,9 @@ mod tests {
             if request.op() == FsOp::Open
                 && request.object().node().map(identity) == Some(protected)
             {
-                return Err(REFUSED);
+                return FsVerdict::Deny(REFUSED);
             }
-            Ok(())
+            FsVerdict::Allow
         });
 
         let (handle, _) = share
@@ -1209,9 +1215,9 @@ mod tests {
                 _ => true,
             };
             if writes && flag.load(Ordering::Relaxed) {
-                return Err(libc::EROFS);
+                return FsVerdict::Deny(libc::EROFS);
             }
-            Ok(())
+            FsVerdict::Allow
         });
         fn erofs(result: io::Result<impl Sized>) -> bool {
             matches!(result, Err(e) if e.raw_os_error() == Some(libc::EROFS))

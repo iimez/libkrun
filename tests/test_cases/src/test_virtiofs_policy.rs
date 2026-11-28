@@ -56,7 +56,7 @@ mod host {
     }
 
     impl krun::FsPolicy for ProtectDirectory {
-        fn check(&self, request: &krun::FsRequest) -> Result<(), i32> {
+        fn check(&self, request: &krun::FsRequest) -> krun::FsVerdict {
             let flags = request.flags();
             let changes = match request.op() {
                 krun::FsOp::Open => flags & 3 != 0 || flags & 0o1000 != 0,
@@ -69,9 +69,9 @@ mod host {
             let inside = self.protects(request.object())
                 || request.target().is_some_and(|target| self.protects(target));
             if changes && inside && self.locked.load(Ordering::SeqCst) {
-                return Err(EACCES);
+                return krun::FsVerdict::Deny(EACCES);
             }
-            Ok(())
+            krun::FsVerdict::Allow
         }
     }
 

@@ -1324,13 +1324,13 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         use std::sync::Mutex;
 
-        use crate::virtio::fs::policy::{FsOp, FsPolicy, FsRequest, PolicyFs};
+        use crate::virtio::fs::policy::{FsOp, FsPolicy, FsRequest, FsVerdict, PolicyFs};
 
         type Seen = (Option<PathBuf>, Option<(u64, u64)>);
         struct Record(Mutex<Vec<Seen>>);
 
         impl FsPolicy for Record {
-            fn check(&self, request: &FsRequest) -> Result<(), i32> {
+            fn check(&self, request: &FsRequest) -> FsVerdict {
                 let object = request.object();
                 let path = object.path().map(PathBuf::from);
                 let node = object.node().map(|node| (node.dev, node.ino));
@@ -1338,9 +1338,9 @@ mod tests {
                     && request.op() != FsOp::Opendir;
                 self.0.lock().unwrap().push((path, node));
                 if refuse {
-                    return Err(libc::EACCES);
+                    return FsVerdict::Deny(libc::EACCES);
                 }
-                Ok(())
+                FsVerdict::Allow
             }
         }
 

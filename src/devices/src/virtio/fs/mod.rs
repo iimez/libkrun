@@ -44,7 +44,7 @@ pub use self::device::Fs;
 #[cfg(unix)]
 pub use self::dynamic_root::DynamicShares;
 pub use self::filesystem::ExportTable;
-pub use self::policy::{FsObject, FsOp, FsPolicy, FsRequest, HostNode};
+pub use self::policy::{FsObject, FsOp, FsPolicy, FsRequest, FsVerdict, HostNode};
 
 /// Guest file-data caching policy for a host-backed virtio-fs filesystem.
 #[cfg_attr(
